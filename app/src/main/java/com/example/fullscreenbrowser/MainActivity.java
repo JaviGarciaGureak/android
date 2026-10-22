@@ -2,7 +2,14 @@ package com.example.fullscreenbrowser;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.AlertDialog;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.graphics.drawable.Drawable;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
@@ -82,6 +89,7 @@ public class MainActivity extends Activity {
     private static final String KEY_START_MODE = "start_mode"; // "hub" o "default"
     private static final String KEY_PW_SALT = "pw_salt";
     private static final String KEY_PW_HASH = "pw_hash";
+    private static final String KEY_KIOSK = "kiosk_mode";
 
     // Contraseña inicial. Cámbiala desde Administración > Cambiar contraseña.
     private static final String DEFAULT_PASSWORD = "Gureak$1";
@@ -111,11 +119,18 @@ public class MainActivity extends Activity {
         void onImage(Bitmap bmp);
     }
 
+    private interface AppPickCallback {
+        void onPicked(String pkg, String label);
+    }
+
     private static class Site {
         String id;
         String name;
         String url;
         String icon;
+        String pkg = "";          // paquete de la app instalada (vacío = página web)
+        boolean locked = false;   // bloqueada: para salir pide la contraseña
+        boolean isApp() { return pkg != null && !pkg.isEmpty(); }
         Site(String id, String name, String url, String icon) {
             this.id = id;
             this.name = name;
@@ -140,6 +155,8 @@ public class MainActivity extends Activity {
     private TextView hubTitle;
     private ImageView hubLogo;
     private boolean pendingKeepAspect = false;
+    private Site lockedSite;
+    private AlertDialog pwDialog;
     private HubAdapter hubAdapter;
     private LinearLayout controls;
     private TextView settingsButton;
@@ -237,6 +254,8 @@ public class MainActivity extends Activity {
         loadAll();
         ensurePassword();
 
+        applyKioskPolicy();
+
         String mode = prefs().getString(KEY_START_MODE, "hub");
         Site def = findById(defaultId);
         if ("default".equals(mode) && def != null) {
@@ -244,6 +263,7 @@ public class MainActivity extends Activity {
         } else {
             showHub();
         }
+        handler.postDelayed(this::updateLockTask, 600);
     }
 
     @SuppressWarnings("deprecation")
@@ -269,10 +289,10 @@ public class MainActivity extends Activity {
         if (customView != null) {
             webView.getWebChromeClient().onHideCustomView();
         } else if (inHub) {
-            super.onBackPressed();
+            if (!kioskEnabled()) super.onBackPressed();
         } else if (webView.canGoBack()) {
             webView.goBack();
-        } else {
+        } else if (lockedSite == null) {
             showHub();
         }
     }
@@ -283,6 +303,35 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (!inHub) webView.onResume();
+        if (isDeviceOwner()) updateLockTask();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent != null && Intent.ACTION_MAIN.equals(intent.getAction())
+                && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            handleHomePressed();
+        }
+    }
+
+    /** Botón Inicio del sistema (si esta app es el launcher): si hay una app bloqueada, pide contraseña. */
+    private void handleHomePressed() {
+        if (lockedSite != null) {
+            final Site s = lockedSite;
+            askPassword(this::leaveLock, () -> {
+                if (s.isApp()) launchApp(s);
+            }, false);
+        } else if (!inHub) {
+            showHub();
+        }
+    }
+
+    private void leaveLock() {
+        lockedSite = null;
+        updateLockTask();
+        showHub();
     }
 
     @Override
@@ -436,7 +485,13 @@ public class MainActivity extends Activity {
         root.addView(controls, lp);
 
         settingsButton.setOnClickListener(v -> askPassword(this::showAdminDialog));
-        homeButton.setOnClickListener(v -> showHub());
+        homeButton.setOnClickListener(v -> {
+            if (lockedSite != null) {
+                askPassword(this::leaveLock, null, true);
+            } else {
+                showHub();
+            }
+        });
     }
 
     private TextView circleButton(String text) {
@@ -471,7 +526,13 @@ public class MainActivity extends Activity {
     }
 
     private void openSite(Site site) {
+        if (site.isApp()) {
+            launchApp(site);
+            return;
+        }
         inHub = false;
+        lockedSite = site.locked ? site : null;
+        updateLockTask();
         hubView.setVisibility(View.GONE);
         webView.setVisibility(View.VISIBLE);
         webView.onResume();
@@ -526,12 +587,18 @@ public class MainActivity extends Activity {
     // ============================================================== iconos
 
     private View iconView(String icon, int emojiSp, int radiusDp) {
+        int cp = 0x1F310;
         if (icon != null && icon.startsWith("i:")) {
             Bitmap b = loadIconBitmap(icon.substring(2));
             if (b != null) return bitmapView(b, radiusDp);
-        }
-        int cp = 0x1F310;
-        if (icon != null && icon.startsWith("e:")) {
+        } else if (icon != null && icon.startsWith("a:")) {
+            try {
+                Drawable d = getPackageManager().getApplicationIcon(icon.substring(2));
+                return drawableView(d, radiusDp);
+            } catch (PackageManager.NameNotFoundException e) {
+                cp = 0x1F4F1; // app no instalada en este dispositivo
+            }
+        } else if (icon != null && icon.startsWith("e:")) {
             try {
                 cp = Integer.parseInt(icon.substring(2));
             } catch (NumberFormatException ignored) { }
@@ -546,6 +613,20 @@ public class MainActivity extends Activity {
     private View bitmapView(Bitmap b, final int radiusDp) {
         ImageView iv = new ImageView(this);
         iv.setImageBitmap(b);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(radiusDp));
+            }
+        });
+        iv.setClipToOutline(true);
+        return iv;
+    }
+
+    private View drawableView(Drawable d, final int radiusDp) {
+        ImageView iv = new ImageView(this);
+        iv.setImageDrawable(d);
         iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
         iv.setOutlineProvider(new ViewOutlineProvider() {
             @Override
@@ -720,6 +801,8 @@ public class MainActivity extends Activity {
             o.put("name", s.name);
             o.put("url", s.url);
             o.put("icon", s.icon);
+            o.put("pkg", s.pkg);
+            o.put("locked", s.locked);
             if (s.icon != null && s.icon.startsWith("i:")) {
                 String b64 = fileToBase64(new File(getFilesDir(), s.icon.substring(2)));
                 if (b64 != null) o.put("icon_image", b64);
@@ -798,12 +881,22 @@ public class MainActivity extends Activity {
 
     /** Crea una aplicación a partir del JSON; null si los datos no son válidos. */
     private Site importSite(JSONObject o, boolean keepId) {
-        String url = normalizeUrl(o.optString("url", ""));
-        if (url == null) return null;
+        String pkg = o.optString("pkg", "");
+        boolean app = pkg.matches("[A-Za-z0-9._]{1,200}");
+        if (!app) pkg = "";
+        String url = "";
+        if (!app) {
+            url = normalizeUrl(o.optString("url", ""));
+            if (url == null) return null;
+        }
         String name = o.optString("name", "").trim();
         if (name.isEmpty()) {
-            String host = Uri.parse(url).getHost();
-            name = host != null ? host : url;
+            if (app) {
+                name = pkg;
+            } else {
+                String host = Uri.parse(url).getHost();
+                name = host != null ? host : url;
+            }
         }
         String id = keepId ? o.optString("id", "") : "";
         if (!id.matches("[A-Za-z0-9\\-]{1,64}") || findById(id) != null) {
@@ -818,10 +911,15 @@ public class MainActivity extends Activity {
             } else {
                 icon = DEFAULT_ICON;
             }
+        } else if (icon.startsWith("a:")) {
+            icon = app ? "a:" + pkg : DEFAULT_ICON;
         } else if (!icon.startsWith("e:")) {
             icon = DEFAULT_ICON;
         }
-        return new Site(id, name, url, icon);
+        Site site = new Site(id, name, url, icon);
+        site.pkg = pkg;
+        site.locked = o.optBoolean("locked", false);
+        return site;
     }
 
     private void applyImport(JSONObject cfg, boolean replace) {
@@ -842,7 +940,13 @@ public class MainActivity extends Activity {
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) continue;
-            if (!replace && urlExists(normalizeUrl(o.optString("url", "")))) continue;
+            if (!replace) {
+                String ipkg = o.optString("pkg", "");
+                boolean dup = !ipkg.isEmpty()
+                        ? pkgExists(ipkg)
+                        : urlExists(normalizeUrl(o.optString("url", "")));
+                if (dup) continue;
+            }
             Site s = importSite(o, replace);
             if (s != null) {
                 sites.add(s);
@@ -877,6 +981,201 @@ public class MainActivity extends Activity {
         refreshHub();
         showAdminDialog();
         Toast.makeText(this, "Importadas " + added + " aplicaciones", Toast.LENGTH_LONG).show();
+    }
+
+    // ====================================================== quiosco / apps instaladas
+
+    private boolean kioskEnabled() {
+        return prefs().getBoolean(KEY_KIOSK, false);
+    }
+
+    private DevicePolicyManager dpm() {
+        return (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+    }
+
+    private ComponentName adminComponent() {
+        return new ComponentName(this, AdminReceiver.class);
+    }
+
+    private boolean isDeviceOwner() {
+        try {
+            return dpm().isDeviceOwnerApp(getPackageName());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isInLockTask() {
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            return am.getLockTaskModeState() != ActivityManager.LOCK_TASK_MODE_NONE;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean pkgExists(String pkg) {
+        for (Site s : sites) {
+            if (pkg.equals(s.pkg)) return true;
+        }
+        return false;
+    }
+
+    /** Con la app como propietaria del dispositivo: autoriza las apps del Hub en el modo quiosco,
+     *  deja solo el botón Inicio y, si el quiosco está activo, fija esta app como launcher. */
+    private void applyKioskPolicy() {
+        if (!isDeviceOwner()) return;
+        try {
+            DevicePolicyManager d = dpm();
+            ComponentName admin = adminComponent();
+            List<String> allowed = new ArrayList<>();
+            allowed.add(getPackageName());
+            for (Site s : sites) {
+                if (s.isApp() && !allowed.contains(s.pkg)) allowed.add(s.pkg);
+            }
+            d.setLockTaskPackages(admin, allowed.toArray(new String[0]));
+            if (Build.VERSION.SDK_INT >= 28) {
+                d.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_HOME);
+            }
+            if (kioskEnabled()) {
+                IntentFilter f = new IntentFilter(Intent.ACTION_MAIN);
+                f.addCategory(Intent.CATEGORY_HOME);
+                f.addCategory(Intent.CATEGORY_DEFAULT);
+                d.addPersistentPreferredActivity(admin, f, new ComponentName(this, MainActivity.class));
+            } else {
+                d.clearPackagePersistentPreferredActivities(admin, getPackageName());
+            }
+        } catch (Exception ignored) { }
+    }
+
+    /** Entra o sale del modo de bloqueo de tareas (Lock Task) según el quiosco y la app bloqueada. */
+    private void updateLockTask() {
+        boolean lockedNeedsPin = lockedSite != null && (!lockedSite.isApp() || isDeviceOwner());
+        boolean want = kioskEnabled() || lockedNeedsPin;
+        try {
+            if (want) {
+                if (!isInLockTask()) startLockTask();
+            } else if (isInLockTask()) {
+                stopLockTask();
+            }
+        } catch (Exception ignored) { }
+    }
+
+    private void launchApp(Site site) {
+        Intent li = getPackageManager().getLaunchIntentForPackage(site.pkg);
+        if (li == null) {
+            Toast.makeText(this, "La aplicación no está instalada en este dispositivo",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (!isDeviceOwner() && isInLockTask()) {
+            Toast.makeText(this, "Con la pantalla fijada Android no permite abrir otras aplicaciones. "
+                    + "Activa el propietario del dispositivo (ver Administración).",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        lockedSite = site.locked ? site : null;
+        updateLockTask();
+        li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(li);
+        } catch (Exception e) {
+            lockedSite = null;
+            Toast.makeText(this, "No se pudo abrir la aplicación", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void showAppPicker(final AppPickCallback cb) {
+        final PackageManager pm = getPackageManager();
+        Intent main = new Intent(Intent.ACTION_MAIN);
+        main.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> found = pm.queryIntentActivities(main, 0);
+        final List<ResolveInfo> apps = new ArrayList<>();
+        List<String> seen = new ArrayList<>();
+        for (ResolveInfo item : found) {
+            String p = item.activityInfo.packageName;
+            if (p.equals(getPackageName()) || seen.contains(p)) continue;
+            seen.add(p);
+            apps.add(item);
+        }
+        if (apps.isEmpty()) {
+            Toast.makeText(this, "No se encontraron aplicaciones instaladas", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Collections.sort(apps, (a, b) ->
+                a.loadLabel(pm).toString().compareToIgnoreCase(b.loadLabel(pm).toString()));
+
+        BaseAdapter adapter = new BaseAdapter() {
+            @Override public int getCount() { return apps.size(); }
+            @Override public Object getItem(int i) { return apps.get(i); }
+            @Override public long getItemId(int i) { return i; }
+
+            @Override
+            public View getView(int i, View convertView, ViewGroup parent) {
+                ResolveInfo info = apps.get(i);
+                LinearLayout row = new LinearLayout(MainActivity.this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(16), dp(8), dp(16), dp(8));
+
+                ImageView iv = new ImageView(MainActivity.this);
+                iv.setImageDrawable(info.loadIcon(pm));
+                row.addView(iv, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
+                LinearLayout texts = new LinearLayout(MainActivity.this);
+                texts.setOrientation(LinearLayout.VERTICAL);
+                texts.setPadding(dp(12), 0, 0, 0);
+                TextView label = new TextView(MainActivity.this);
+                label.setText(info.loadLabel(pm));
+                label.setTextSize(16);
+                label.setSingleLine(true);
+                label.setEllipsize(TextUtils.TruncateAt.END);
+                TextView pkgText = new TextView(MainActivity.this);
+                pkgText.setText(info.activityInfo.packageName);
+                pkgText.setTextSize(11);
+                pkgText.setAlpha(0.6f);
+                pkgText.setSingleLine(true);
+                pkgText.setEllipsize(TextUtils.TruncateAt.END);
+                texts.addView(label);
+                texts.addView(pkgText);
+                row.addView(texts, new LinearLayout.LayoutParams(
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                return row;
+            }
+        };
+
+        new AlertDialog.Builder(this)
+                .setTitle("Aplicaciones instaladas")
+                .setAdapter(adapter, (d, which) -> {
+                    ResolveInfo chosen = apps.get(which);
+                    cb.onPicked(chosen.activityInfo.packageName, chosen.loadLabel(pm).toString());
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void confirmRemoveOwner() {
+        new AlertDialog.Builder(this)
+                .setTitle("Quitar propietario del dispositivo")
+                .setMessage("La app dejará de poder bloquear el dispositivo y se desactivará el modo quiosco. ¿Continuar?")
+                .setPositiveButton("Quitar", (d, w) -> {
+                    prefs().edit().putBoolean(KEY_KIOSK, false).apply();
+                    lockedSite = null;
+                    try {
+                        applyKioskPolicy();
+                        updateLockTask();
+                        dpm().clearDeviceOwnerApp(getPackageName());
+                        Toast.makeText(this, "Propietario del dispositivo eliminado",
+                                Toast.LENGTH_LONG).show();
+                    } catch (Exception e) {
+                        Toast.makeText(this, "No se pudo quitar el propietario del dispositivo",
+                                Toast.LENGTH_LONG).show();
+                    }
+                    showAdminDialog();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     // ============================================================ contraseña
@@ -926,7 +1225,12 @@ public class MainActivity extends Activity {
         return et;
     }
 
-    private void askPassword(final Runnable onSuccess) {
+    private void askPassword(Runnable onSuccess) {
+        askPassword(onSuccess, null, true);
+    }
+
+    private void askPassword(final Runnable onSuccess, final Runnable onCancel, boolean cancelable) {
+        if (pwDialog != null && pwDialog.isShowing()) return;
         final EditText input = passwordField("Contraseña");
         input.setImeOptions(EditorInfo.IME_ACTION_DONE);
 
@@ -939,9 +1243,16 @@ public class MainActivity extends Activity {
                 .setTitle("Administración")
                 .setMessage("Introduce la contraseña")
                 .setView(box)
+                .setCancelable(cancelable)
                 .setPositiveButton("Entrar", null)
-                .setNegativeButton("Cancelar", null)
+                .setNegativeButton("Cancelar", (d, w) -> {
+                    if (onCancel != null) onCancel.run();
+                })
                 .create();
+        dialog.setOnCancelListener(d -> {
+            if (onCancel != null) onCancel.run();
+        });
+        pwDialog = dialog;
         dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
         dialog.show();
 
@@ -1027,7 +1338,10 @@ public class MainActivity extends Activity {
                     icon = DEFAULT_ICON;
                     changed = true;
                 }
-                sites.add(new Site(id, o.getString("name"), o.getString("url"), icon));
+                Site loaded = new Site(id, o.getString("name"), o.optString("url", ""), icon);
+                loaded.pkg = o.optString("pkg", "");
+                loaded.locked = o.optBoolean("locked", false);
+                sites.add(loaded);
             }
         } catch (JSONException ignored) { }
 
@@ -1072,6 +1386,8 @@ public class MainActivity extends Activity {
                 o.put("name", s.name);
                 o.put("url", s.url);
                 o.put("icon", s.icon);
+                o.put("pkg", s.pkg);
+                o.put("locked", s.locked);
                 arr.put(o);
             }
         } catch (JSONException ignored) { }
@@ -1082,6 +1398,7 @@ public class MainActivity extends Activity {
             e.remove(KEY_DEFAULT);
         }
         e.apply();
+        applyKioskPolicy();
     }
 
     private String normalizeUrl(String raw) {
@@ -1201,6 +1518,13 @@ public class MainActivity extends Activity {
             row.addView(name, new LinearLayout.LayoutParams(0,
                     ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+            if (s.locked) {
+                TextView lockMark = new TextView(this);
+                lockMark.setText(emoji(0x1F512));
+                lockMark.setTextSize(16);
+                lockMark.setPadding(0, 0, dp(6), 0);
+                row.addView(lockMark);
+            }
             if (s.id.equals(defaultId)) {
                 TextView star = new TextView(this);
                 star.setText("\u2605");
@@ -1216,6 +1540,31 @@ public class MainActivity extends Activity {
         add.setText("Añadir aplicación");
         add.setOnClickListener(v -> showEditDialog(-1));
         col.addView(add);
+
+        col.addView(sectionTitle("Modo quiosco"));
+        TextView kioskStatus = new TextView(this);
+        kioskStatus.setTextSize(12);
+        kioskStatus.setAlpha(0.8f);
+        kioskStatus.setText(isDeviceOwner()
+                ? "Estado: la app es propietaria del dispositivo. El quiosco nativo bloquea Recientes, notificaciones y el cambio de aplicación."
+                : "Estado: la app NO es propietaria del dispositivo, así que Android solo fijará la pantalla (se sale con Atrás + Recientes). Para el quiosco completo ejecuta por ADB:\ndpm set-device-owner "
+                        + getPackageName() + "/.AdminReceiver");
+        col.addView(kioskStatus);
+        CheckBox kioskCheck = new CheckBox(this);
+        kioskCheck.setText("Activar modo quiosco");
+        kioskCheck.setChecked(kioskEnabled());
+        kioskCheck.setOnCheckedChangeListener((btn, checked) -> {
+            prefs().edit().putBoolean(KEY_KIOSK, checked).apply();
+            applyKioskPolicy();
+            updateLockTask();
+        });
+        col.addView(kioskCheck);
+        if (isDeviceOwner()) {
+            Button ownerBtn = new Button(this);
+            ownerBtn.setText("Quitar propietario del dispositivo");
+            ownerBtn.setOnClickListener(v -> confirmRemoveOwner());
+            col.addView(ownerBtn);
+        }
 
         col.addView(sectionTitle("Copia de seguridad / otros dispositivos"));
         Button exp = new Button(this);
@@ -1432,6 +1781,8 @@ public class MainActivity extends Activity {
         final String siteId = editing != null ? editing.id : UUID.randomUUID().toString();
         final String[] iconRef = { editing != null ? editing.icon : DEFAULT_ICON };
         final Bitmap[] newBmp = { null };
+        final String[] pkgRef = { editing != null ? editing.pkg : "" };
+        final boolean[] isApp = { editing != null && editing.isApp() };
 
         final EditText nameInput = new EditText(this);
         nameInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
@@ -1447,6 +1798,40 @@ public class MainActivity extends Activity {
             nameInput.setText(editing.name);
             urlInput.setText(editing.url);
         }
+
+        final RadioButton rbWeb = new RadioButton(this);
+        rbWeb.setText("Página web");
+        rbWeb.setId(View.generateViewId());
+        final RadioButton rbApp = new RadioButton(this);
+        rbApp.setText("Aplicación instalada");
+        rbApp.setId(View.generateViewId());
+        final RadioGroup typeGroup = new RadioGroup(this);
+        typeGroup.setOrientation(LinearLayout.HORIZONTAL);
+        typeGroup.addView(rbWeb);
+        typeGroup.addView(rbApp);
+        (isApp[0] ? rbApp : rbWeb).setChecked(true);
+
+        final LinearLayout appBox = new LinearLayout(this);
+        appBox.setOrientation(LinearLayout.VERTICAL);
+        final TextView appLabel = new TextView(this);
+        appLabel.setText(isApp[0] ? pkgRef[0] : "Ninguna aplicación seleccionada");
+        appLabel.setPadding(0, dp(8), 0, 0);
+        final Button appPick = new Button(this);
+        appPick.setText("Elegir aplicación instalada…");
+        appBox.addView(appLabel);
+        appBox.addView(appPick);
+        urlInput.setVisibility(isApp[0] ? View.GONE : View.VISIBLE);
+        appBox.setVisibility(isApp[0] ? View.VISIBLE : View.GONE);
+        typeGroup.setOnCheckedChangeListener((g, checkedId) -> {
+            boolean appSelected = checkedId == rbApp.getId();
+            isApp[0] = appSelected;
+            urlInput.setVisibility(appSelected ? View.GONE : View.VISIBLE);
+            appBox.setVisibility(appSelected ? View.VISIBLE : View.GONE);
+        });
+
+        final CheckBox lockedCheck = new CheckBox(this);
+        lockedCheck.setText("Bloquear al abrir (para salir pide la contraseña)");
+        lockedCheck.setChecked(editing != null && editing.locked);
 
         final CheckBox defaultCheck = new CheckBox(this);
         defaultCheck.setText("Abrir esta página por defecto al iniciar");
@@ -1492,6 +1877,15 @@ public class MainActivity extends Activity {
             grid.addView(c, gp);
         }
 
+        appPick.setOnClickListener(v -> showAppPicker((pickedPkg, pickedLabel) -> {
+            pkgRef[0] = pickedPkg;
+            appLabel.setText(pickedLabel + "  (" + pickedPkg + ")");
+            if (nameInput.getText().toString().trim().isEmpty()) nameInput.setText(pickedLabel);
+            iconRef[0] = "a:" + pickedPkg;
+            newBmp[0] = null;
+            refresh.run();
+        }));
+
         Button imgBtn = new Button(this);
         imgBtn.setText("Elegir imagen…");
         imgBtn.setOnClickListener(v -> {
@@ -1523,12 +1917,15 @@ public class MainActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(8), dp(20), dp(8));
+        box.addView(typeGroup);
         box.addView(nameInput);
         box.addView(urlInput);
+        box.addView(appBox);
         box.addView(sectionTitle("Icono"));
         box.addView(iconRow);
         box.addView(grid);
         box.addView(defaultCheck);
+        box.addView(lockedCheck);
 
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
@@ -1545,18 +1942,33 @@ public class MainActivity extends Activity {
         refresh.run();
 
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-            String url = normalizeUrl(urlInput.getText().toString());
-            if (url == null) {
-                Toast.makeText(this, "URL no válida", Toast.LENGTH_SHORT).show();
-                return;
+            String url = "";
+            String appPkg = "";
+            if (isApp[0]) {
+                appPkg = pkgRef[0] == null ? "" : pkgRef[0];
+                if (appPkg.isEmpty()) {
+                    Toast.makeText(this, "Elige una aplicación instalada", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            } else {
+                url = normalizeUrl(urlInput.getText().toString());
+                if (url == null) {
+                    Toast.makeText(this, "URL no válida (usa http o https)", Toast.LENGTH_SHORT).show();
+                    return;
+                }
             }
             String name = nameInput.getText().toString().trim();
             if (name.isEmpty()) {
-                String host = Uri.parse(url).getHost();
-                name = host != null ? host : url;
+                if (isApp[0]) {
+                    name = appPkg;
+                } else {
+                    String host = Uri.parse(url).getHost();
+                    name = host != null ? host : url;
+                }
             }
 
             String icon = iconRef[0];
+            if (!isApp[0] && icon != null && icon.startsWith("a:")) icon = DEFAULT_ICON;
             if (newBmp[0] != null) {
                 String file = saveIconBitmap(newBmp[0], siteId);
                 if (file == null) {
@@ -1573,8 +1985,13 @@ public class MainActivity extends Activity {
                 editing.name = name;
                 editing.url = url;
                 editing.icon = icon;
+                editing.pkg = appPkg;
+                editing.locked = lockedCheck.isChecked();
             } else {
-                sites.add(new Site(siteId, name, url, icon));
+                Site created = new Site(siteId, name, url, icon);
+                created.pkg = appPkg;
+                created.locked = lockedCheck.isChecked();
+                sites.add(created);
             }
 
             // Solo puede haber una página por defecto
