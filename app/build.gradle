@@ -1,0 +1,32 @@
+plugins {
+    id 'com.android.application'
+}
+
+base {
+    archivesName = "Navegador"
+}
+
+android {
+    namespace 'com.example.fullscreenbrowser'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.fullscreenbrowser"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
