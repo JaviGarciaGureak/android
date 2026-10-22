@@ -86,6 +86,11 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_IMAGE = 1001;
     private static final String DEFAULT_ICON = "e:127760";
 
+    private static final String KEY_HEADER_TITLE = "header_title";
+    private static final String KEY_HEADER_SHOW = "header_show";
+    private static final String HEADER_IMAGE_FILE = "header_image.png";
+    private static final String DEFAULT_HEADER_TITLE = "Aplicaciones";
+
     // Iconos disponibles (puntos de código Unicode de emojis)
     private static final int[] EMOJIS = {
             0x1F310, 0x1F3E0, 0x1F4F7, 0x1F4F9, 0x1F4FA, 0x1F4CA, 0x1F4C8, 0x1F4C5,
@@ -124,6 +129,10 @@ public class MainActivity extends Activity {
     private LinearLayout hubView;
     private GridView hubGrid;
     private TextView hubEmpty;
+    private LinearLayout hubHeader;
+    private TextView hubTitle;
+    private ImageView hubLogo;
+    private boolean pendingKeepAspect = false;
     private HubAdapter hubAdapter;
     private LinearLayout controls;
     private TextView settingsButton;
@@ -285,7 +294,9 @@ public class MainActivity extends Activity {
             ImageCallback cb = pendingImageCallback;
             pendingImageCallback = null;
             if (resultCode == RESULT_OK && data != null && data.getData() != null && cb != null) {
-                Bitmap bmp = decodeSquareIcon(data.getData());
+                Bitmap bmp = pendingKeepAspect
+                        ? decodeScaled(data.getData(), 128)
+                        : decodeSquareIcon(data.getData());
                 if (bmp != null) {
                     cb.onImage(bmp);
                 } else {
@@ -314,13 +325,30 @@ public class MainActivity extends Activity {
         hubView.setOrientation(LinearLayout.VERTICAL);
         hubView.setBackgroundColor(Color.rgb(16, 22, 36));
 
-        TextView title = new TextView(this);
-        title.setText("Aplicaciones");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(24);
-        title.setTypeface(null, Typeface.BOLD);
-        title.setPadding(dp(24), dp(48), dp(24), dp(8));
-        hubView.addView(title);
+        // Cabecera compacta: imagen (opcional) + título
+        hubHeader = new LinearLayout(this);
+        hubHeader.setOrientation(LinearLayout.HORIZONTAL);
+        hubHeader.setGravity(Gravity.CENTER_VERTICAL);
+        hubHeader.setPadding(dp(20), dp(34), dp(20), dp(6));
+
+        hubLogo = new ImageView(this);
+        hubLogo.setAdjustViewBounds(true);
+        hubLogo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        hubLogo.setMaxWidth(dp(120));
+        LinearLayout.LayoutParams logoLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+        logoLp.rightMargin = dp(10);
+        hubHeader.addView(hubLogo, logoLp);
+
+        hubTitle = new TextView(this);
+        hubTitle.setTextColor(Color.WHITE);
+        hubTitle.setTextSize(20);
+        hubTitle.setTypeface(null, Typeface.BOLD);
+        hubTitle.setSingleLine(true);
+        hubTitle.setEllipsize(TextUtils.TruncateAt.END);
+        hubHeader.addView(hubTitle, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        hubView.addView(hubHeader);
 
         hubEmpty = new TextView(this);
         hubEmpty.setText("No hay aplicaciones configuradas.\nPulsa \u2699 e introduce la contraseña para añadirlas.");
@@ -347,6 +375,31 @@ public class MainActivity extends Activity {
 
         root.addView(hubView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        refreshHeader();
+    }
+
+    /** Aplica título, imagen y visibilidad de la cabecera según la configuración. */
+    private void refreshHeader() {
+        SharedPreferences p = prefs();
+        String title = p.getString(KEY_HEADER_TITLE, DEFAULT_HEADER_TITLE).trim();
+        boolean show = p.getBoolean(KEY_HEADER_SHOW, true);
+        Bitmap logo = BitmapFactory.decodeFile(new File(getFilesDir(), HEADER_IMAGE_FILE).getPath());
+
+        if (logo != null) {
+            hubLogo.setImageBitmap(logo);
+            hubLogo.setVisibility(View.VISIBLE);
+        } else {
+            hubLogo.setImageDrawable(null);
+            hubLogo.setVisibility(View.GONE);
+        }
+        hubTitle.setText(title);
+        hubTitle.setVisibility(title.isEmpty() ? View.GONE : View.VISIBLE);
+
+        boolean visible = show && (logo != null || !title.isEmpty());
+        hubHeader.setVisibility(visible ? View.VISIBLE : View.GONE);
+        // Sin cabecera, se deja más espacio arriba para la barra de estado / muesca
+        hubGrid.setPadding(dp(16), visible ? dp(10) : dp(44), dp(16), dp(110));
+        hubEmpty.setPadding(dp(24), visible ? dp(24) : dp(56), dp(24), dp(24));
     }
 
     private void buildControls() {
@@ -413,6 +466,7 @@ public class MainActivity extends Activity {
     }
 
     private void refreshHub() {
+        refreshHeader();
         hubAdapter.notifyDataSetChanged();
         hubEmpty.setVisibility(sites.isEmpty() ? View.VISIBLE : View.GONE);
     }
@@ -528,6 +582,35 @@ public class MainActivity extends Activity {
             Bitmap sq = Bitmap.createBitmap(b, (b.getWidth() - side) / 2,
                     (b.getHeight() - side) / 2, side, side);
             return Bitmap.createScaledBitmap(sq, 192, 192, true);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Reduce la imagen manteniendo su proporción (alto máx. maxSide, ancho máx. 4x). */
+    private Bitmap decodeScaled(Uri uri, int maxSide) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                BitmapFactory.decodeStream(in, null, o);
+            }
+            int sample = 1;
+            while (o.outWidth / (sample * 2) >= maxSide * 2 && o.outHeight / (sample * 2) >= maxSide * 2) {
+                sample *= 2;
+            }
+            BitmapFactory.Options o2 = new BitmapFactory.Options();
+            o2.inSampleSize = sample;
+            Bitmap b;
+            try (InputStream in2 = getContentResolver().openInputStream(uri)) {
+                b = BitmapFactory.decodeStream(in2, null, o2);
+            }
+            if (b == null) return null;
+            float scale = Math.min(1f, Math.min(
+                    (float) maxSide / b.getHeight(), (float) (maxSide * 4) / b.getWidth()));
+            if (scale >= 1f) return b;
+            return Bitmap.createScaledBitmap(b, Math.max(1, Math.round(b.getWidth() * scale)),
+                    Math.max(1, Math.round(b.getHeight() * scale)), true);
         } catch (Exception e) {
             return null;
         }
@@ -796,6 +879,21 @@ public class MainActivity extends Activity {
         hint.setAlpha(0.7f);
         col.addView(hint);
 
+        // --- Cabecera del Hub
+        col.addView(sectionTitle("Cabecera del Hub"));
+        CheckBox showHeader = new CheckBox(this);
+        showHeader.setText("Mostrar cabecera");
+        showHeader.setChecked(prefs().getBoolean(KEY_HEADER_SHOW, true));
+        showHeader.setOnCheckedChangeListener((btn, checked) -> {
+            prefs().edit().putBoolean(KEY_HEADER_SHOW, checked).apply();
+            refreshHeader();
+        });
+        col.addView(showHeader);
+        Button editHeader = new Button(this);
+        editHeader.setText("Editar título e imagen");
+        editHeader.setOnClickListener(v -> showHeaderDialog());
+        col.addView(editHeader);
+
         // --- Lista de aplicaciones
         col.addView(sectionTitle("Aplicaciones (toca una para ver opciones)"));
         if (sites.isEmpty()) {
@@ -937,6 +1035,119 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /** Editar el título y la imagen de la cabecera del Hub. */
+    private void showHeaderDialog() {
+        final SharedPreferences p = prefs();
+
+        final EditText titleInput = new EditText(this);
+        titleInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        titleInput.setHint("Título de la cabecera");
+        titleInput.setSingleLine(true);
+        titleInput.setText(p.getString(KEY_HEADER_TITLE, DEFAULT_HEADER_TITLE));
+
+        final File headerFile = new File(getFilesDir(), HEADER_IMAGE_FILE);
+        final Bitmap[] img = { BitmapFactory.decodeFile(headerFile.getPath()) };
+        final boolean[] changed = { false };
+
+        final FrameLayout preview = new FrameLayout(this);
+        preview.setBackground(cellBg(false, 10));
+        final Runnable refresh = new Runnable() {
+            @Override public void run() {
+                preview.removeAllViews();
+                if (img[0] != null) {
+                    ImageView iv = new ImageView(MainActivity.this);
+                    iv.setImageBitmap(img[0]);
+                    iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                    iv.setPadding(dp(4), dp(4), dp(4), dp(4));
+                    preview.addView(iv, new FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                } else {
+                    TextView none = new TextView(MainActivity.this);
+                    none.setText("Sin imagen");
+                    none.setAlpha(0.7f);
+                    none.setGravity(Gravity.CENTER);
+                    preview.addView(none, new FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                }
+            }
+        };
+
+        Button pick = new Button(this);
+        pick.setText("Elegir imagen…");
+        pick.setOnClickListener(v -> {
+            pendingKeepAspect = true;
+            pendingImageCallback = bmp -> {
+                img[0] = bmp;
+                changed[0] = true;
+                refresh.run();
+            };
+            Intent it = new Intent(Intent.ACTION_GET_CONTENT);
+            it.setType("image/*");
+            it.addCategory(Intent.CATEGORY_OPENABLE);
+            try {
+                startActivityForResult(it, REQ_PICK_IMAGE);
+            } catch (Exception e) {
+                Toast.makeText(this, "No se puede abrir el selector de imágenes",
+                        Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        Button remove = new Button(this);
+        remove.setText("Quitar imagen");
+        remove.setOnClickListener(v -> {
+            img[0] = null;
+            changed[0] = true;
+            refresh.run();
+        });
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        buttons.addView(pick);
+        buttons.addView(remove);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), dp(8));
+        box.addView(titleInput);
+        box.addView(sectionTitle("Imagen junto al título"));
+        box.addView(preview, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
+        box.addView(buttons);
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Cabecera del Hub")
+                .setView(sv)
+                .setCancelable(false)
+                .setPositiveButton("Guardar", null)
+                .setNegativeButton("Cancelar", null)
+                .create();
+        dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        dialog.show();
+        refresh.run();
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            p.edit().putString(KEY_HEADER_TITLE, titleInput.getText().toString().trim()).apply();
+            if (changed[0]) {
+                if (img[0] == null) {
+                    headerFile.delete();
+                } else {
+                    try (FileOutputStream out = new FileOutputStream(headerFile)) {
+                        img[0].compress(Bitmap.CompressFormat.PNG, 100, out);
+                    } catch (Exception e) {
+                        Toast.makeText(this, "No se pudo guardar la imagen",
+                                Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                }
+            }
+            refreshHeader();
+            dialog.dismiss();
+        });
+    }
+
     /** Añadir (index = -1) o editar una aplicación: nombre, URL, icono y página por defecto. */
     private void showEditDialog(final int index) {
         final Site editing = index >= 0 ? sites.get(index) : null;
@@ -1006,6 +1217,7 @@ public class MainActivity extends Activity {
         Button imgBtn = new Button(this);
         imgBtn.setText("Elegir imagen…");
         imgBtn.setOnClickListener(v -> {
+            pendingKeepAspect = false;
             pendingImageCallback = bmp -> {
                 newBmp[0] = bmp;
                 refresh.run();
