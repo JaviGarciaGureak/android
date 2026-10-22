@@ -54,7 +54,11 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -84,6 +88,9 @@ public class MainActivity extends Activity {
     private static final int PW_ITERATIONS = 20000;
 
     private static final int REQ_PICK_IMAGE = 1001;
+    private static final int REQ_EXPORT = 1002;
+    private static final int REQ_IMPORT = 1003;
+    private static final String EXPORT_FORMAT = "navegador-hub-config";
     private static final String DEFAULT_ICON = "e:127760";
 
     private static final String KEY_HEADER_TITLE = "header_title";
@@ -290,6 +297,14 @@ public class MainActivity extends Activity {
     @SuppressWarnings("deprecation")
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_EXPORT) {
+            handleExportResult(resultCode, data);
+            return;
+        }
+        if (requestCode == REQ_IMPORT) {
+            handleImportResult(resultCode, data);
+            return;
+        }
         if (requestCode == REQ_PICK_IMAGE) {
             ImageCallback cb = pendingImageCallback;
             pendingImageCallback = null;
@@ -616,6 +631,254 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ====================================================== exportar / importar
+
+    private void startExport() {
+        Intent it = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        it.addCategory(Intent.CATEGORY_OPENABLE);
+        it.setType("application/json");
+        it.putExtra(Intent.EXTRA_TITLE, "navegador-config.json");
+        try {
+            startActivityForResult(it, REQ_EXPORT);
+        } catch (Exception e) {
+            Toast.makeText(this, "No se puede abrir el selector de archivos", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void startImport() {
+        Intent it = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        it.addCategory(Intent.CATEGORY_OPENABLE);
+        it.setType("*/*");
+        try {
+            startActivityForResult(it, REQ_IMPORT);
+        } catch (Exception e) {
+            Toast.makeText(this, "No se puede abrir el selector de archivos", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private byte[] readFileBytes(File f) throws Exception {
+        try (FileInputStream in = new FileInputStream(f);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            return out.toByteArray();
+        }
+    }
+
+    private String fileToBase64(File f) {
+        if (!f.exists()) return null;
+        try {
+            return Base64.encodeToString(readFileBytes(f), Base64.NO_WRAP);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Devuelve los bytes solo si el texto base64 contiene una imagen válida. */
+    private byte[] decodeImageBase64(String s) {
+        if (s == null || s.isEmpty()) return null;
+        try {
+            byte[] data = Base64.decode(s, Base64.DEFAULT);
+            if (BitmapFactory.decodeByteArray(data, 0, data.length) == null) return null;
+            return data;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private boolean writeBytes(File f, byte[] data) {
+        try (FileOutputStream out = new FileOutputStream(f)) {
+            out.write(data);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** JSON con aplicaciones (incluidas sus imágenes), página por defecto, modo de inicio y cabecera.
+     *  La contraseña NO se exporta. */
+    private String buildExportJson() throws Exception {
+        SharedPreferences p = prefs();
+        JSONObject rootObj = new JSONObject();
+        rootObj.put("format", EXPORT_FORMAT);
+        rootObj.put("version", 1);
+        rootObj.put("start_mode", p.getString(KEY_START_MODE, "hub"));
+        if (defaultId != null) rootObj.put("default_id", defaultId);
+
+        JSONObject header = new JSONObject();
+        header.put("title", p.getString(KEY_HEADER_TITLE, DEFAULT_HEADER_TITLE));
+        header.put("show", p.getBoolean(KEY_HEADER_SHOW, true));
+        String headerImg = fileToBase64(new File(getFilesDir(), HEADER_IMAGE_FILE));
+        if (headerImg != null) header.put("image", headerImg);
+        rootObj.put("header", header);
+
+        JSONArray arr = new JSONArray();
+        for (Site s : sites) {
+            JSONObject o = new JSONObject();
+            o.put("id", s.id);
+            o.put("name", s.name);
+            o.put("url", s.url);
+            o.put("icon", s.icon);
+            if (s.icon != null && s.icon.startsWith("i:")) {
+                String b64 = fileToBase64(new File(getFilesDir(), s.icon.substring(2)));
+                if (b64 != null) o.put("icon_image", b64);
+            }
+            arr.put(o);
+        }
+        rootObj.put("sites", arr);
+        return rootObj.toString(2);
+    }
+
+    private void handleExportResult(int resultCode, Intent data) {
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        try {
+            String json = buildExportJson();
+            try (OutputStream out = getContentResolver().openOutputStream(data.getData())) {
+                if (out == null) throw new IllegalStateException("sin salida");
+                out.write(json.getBytes(StandardCharsets.UTF_8));
+            }
+            Toast.makeText(this, "Configuración exportada", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "No se pudo exportar la configuración", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private String readText(Uri uri) throws Exception {
+        try (InputStream in = getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            if (in == null) throw new IllegalStateException("sin entrada");
+            byte[] buf = new byte[8192];
+            int n;
+            long total = 0;
+            while ((n = in.read(buf)) > 0) {
+                total += n;
+                if (total > 30L * 1024 * 1024) throw new IllegalStateException("archivo demasiado grande");
+                out.write(buf, 0, n);
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private void handleImportResult(int resultCode, Intent data) {
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        try {
+            JSONObject cfg = new JSONObject(readText(data.getData()));
+            JSONArray arr = cfg.optJSONArray("sites");
+            if (!EXPORT_FORMAT.equals(cfg.optString("format")) || arr == null) {
+                Toast.makeText(this, "El archivo no es una configuración de esta app",
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
+            showImportChoice(cfg, arr.length());
+        } catch (Exception e) {
+            Toast.makeText(this, "El archivo no es una configuración válida", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void showImportChoice(final JSONObject cfg, int count) {
+        new AlertDialog.Builder(this)
+                .setTitle("Importar configuración")
+                .setMessage("El archivo contiene " + count + " aplicaciones.\n\n"
+                        + "Reemplazar: sustituye las aplicaciones, la cabecera y las opciones actuales.\n\n"
+                        + "Añadir: suma las aplicaciones nuevas a las que ya tienes.")
+                .setPositiveButton("Reemplazar", (d, w) -> applyImport(cfg, true))
+                .setNeutralButton("Añadir", (d, w) -> applyImport(cfg, false))
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private boolean urlExists(String url) {
+        if (url == null) return false;
+        for (Site s : sites) {
+            if (s.url.equalsIgnoreCase(url)) return true;
+        }
+        return false;
+    }
+
+    /** Crea una aplicación a partir del JSON; null si los datos no son válidos. */
+    private Site importSite(JSONObject o, boolean keepId) {
+        String url = normalizeUrl(o.optString("url", ""));
+        if (url == null) return null;
+        String name = o.optString("name", "").trim();
+        if (name.isEmpty()) {
+            String host = Uri.parse(url).getHost();
+            name = host != null ? host : url;
+        }
+        String id = keepId ? o.optString("id", "") : "";
+        if (!id.matches("[A-Za-z0-9\\-]{1,64}") || findById(id) != null) {
+            id = UUID.randomUUID().toString();
+        }
+        String icon = o.optString("icon", DEFAULT_ICON);
+        if (icon.startsWith("i:")) {
+            byte[] img = decodeImageBase64(o.optString("icon_image", ""));
+            String file = "icon_" + id + ".png";
+            if (img != null && writeBytes(new File(getFilesDir(), file), img)) {
+                icon = "i:" + file;
+            } else {
+                icon = DEFAULT_ICON;
+            }
+        } else if (!icon.startsWith("e:")) {
+            icon = DEFAULT_ICON;
+        }
+        return new Site(id, name, url, icon);
+    }
+
+    private void applyImport(JSONObject cfg, boolean replace) {
+        JSONArray arr = cfg.optJSONArray("sites");
+        if (arr == null) return;
+
+        if (replace) {
+            for (Site s : sites) {
+                if (s.icon != null && s.icon.startsWith("i:")) {
+                    new File(getFilesDir(), s.icon.substring(2)).delete();
+                }
+            }
+            sites.clear();
+            defaultId = null;
+        }
+
+        int added = 0;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o == null) continue;
+            if (!replace && urlExists(normalizeUrl(o.optString("url", "")))) continue;
+            Site s = importSite(o, replace);
+            if (s != null) {
+                sites.add(s);
+                added++;
+            }
+        }
+
+        if (replace) {
+            String did = cfg.optString("default_id", "");
+            defaultId = findById(did) != null ? did : null;
+
+            String mode = cfg.optString("start_mode", "hub");
+            SharedPreferences.Editor e = prefs().edit()
+                    .putString(KEY_START_MODE, "default".equals(mode) ? "default" : "hub");
+            JSONObject h = cfg.optJSONObject("header");
+            if (h != null) {
+                e.putString(KEY_HEADER_TITLE, h.optString("title", DEFAULT_HEADER_TITLE));
+                e.putBoolean(KEY_HEADER_SHOW, h.optBoolean("show", true));
+                File hf = new File(getFilesDir(), HEADER_IMAGE_FILE);
+                byte[] img = decodeImageBase64(h.optString("image", ""));
+                if (img != null) {
+                    writeBytes(hf, img);
+                } else {
+                    hf.delete();
+                }
+            }
+            e.apply();
+        }
+
+        iconCache.clear();
+        persist();
+        refreshHub();
+        showAdminDialog();
+        Toast.makeText(this, "Importadas " + added + " aplicaciones", Toast.LENGTH_LONG).show();
+    }
+
     // ============================================================ contraseña
 
     private byte[] pbkdf2(String password, byte[] salt) throws GeneralSecurityException {
@@ -827,6 +1090,11 @@ public class MainActivity extends Activity {
         if (u.isEmpty()) return null;
         if (!u.contains("://")) u = "https://" + u;
         Uri uri = Uri.parse(u);
+        String scheme = uri.getScheme();
+        if (scheme == null
+                || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+            return null;
+        }
         if (uri.getHost() == null || uri.getHost().isEmpty()) return null;
         return u;
     }
@@ -948,6 +1216,16 @@ public class MainActivity extends Activity {
         add.setText("Añadir aplicación");
         add.setOnClickListener(v -> showEditDialog(-1));
         col.addView(add);
+
+        col.addView(sectionTitle("Copia de seguridad / otros dispositivos"));
+        Button exp = new Button(this);
+        exp.setText("Exportar configuración (JSON)");
+        exp.setOnClickListener(v -> startExport());
+        col.addView(exp);
+        Button imp = new Button(this);
+        imp.setText("Importar configuración (JSON)");
+        imp.setOnClickListener(v -> startImport());
+        col.addView(imp);
 
         Button pw = new Button(this);
         pw.setText("Cambiar contraseña");
