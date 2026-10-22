@@ -72,9 +72,9 @@ public class MainActivity extends Activity {
         bg.setColor(Color.argb(150, 0, 0, 0));
         settingsButton.setBackground(bg);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(48), dp(48));
-        lp.gravity = Gravity.TOP | Gravity.END;
-        lp.topMargin = dp(32);
-        lp.rightMargin = dp(16);
+         lp.gravity = Gravity.BOTTOM | Gravity.START;
+          lp.bottomMargin = dp(24);
+           lp.leftMargin = dp(16);
         root.addView(settingsButton, lp);
         settingsButton.setOnClickListener(v -> showUrlDialog(true));
 
