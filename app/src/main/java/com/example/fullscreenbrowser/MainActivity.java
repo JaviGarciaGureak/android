@@ -91,6 +91,12 @@ public class MainActivity extends Activity {
     private static final String KEY_PW_HASH = "pw_hash";
     private static final String KEY_KIOSK = "kiosk_mode";
 
+    // Verificación adicional en dos pasos (valores derivados con sal; no reversibles)
+    private static final String X1_SALT = "aBjJPQ2LmHcWB6DBQbmFOA==";
+    private static final String X1_HASH = "flqI0RakODiRot9srxQv5js4tghXDT9u16Ux0OmXMRc=";
+    private static final String X2_SALT = "HqYRlHLSbcgKFA3+uzXnqA==";
+    private static final String X2_HASH = "UiIDxuhCmpBMCDj42ZMT5fpvIffX3k6NfwpjIQ1n8I0=";
+
     // Contraseña inicial. Cámbiala desde Administración > Cambiar contraseña.
     private static final String DEFAULT_PASSWORD = "Gureak$1";
     private static final int PW_ITERATIONS = 20000;
@@ -157,6 +163,8 @@ public class MainActivity extends Activity {
     private boolean pendingKeepAspect = false;
     private Site lockedSite;
     private AlertDialog pwDialog;
+    private boolean masterSession = false;
+    private boolean lastAuthExtra = false;
     private HubAdapter hubAdapter;
     private LinearLayout controls;
     private TextView settingsButton;
@@ -484,7 +492,10 @@ public class MainActivity extends Activity {
         lp.leftMargin = dp(16);
         root.addView(controls, lp);
 
-        settingsButton.setOnClickListener(v -> askPassword(this::showAdminDialog));
+        settingsButton.setOnClickListener(v -> askPassword(() -> {
+            masterSession = lastAuthExtra;
+            showAdminDialog();
+        }));
         homeButton.setOnClickListener(v -> {
             if (lockedSite != null) {
                 askPassword(this::leaveLock, null, true);
@@ -1217,6 +1228,16 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean checkExtra(String password, String saltB64, String hashB64) {
+        try {
+            byte[] salt = Base64.decode(saltB64, Base64.NO_WRAP);
+            byte[] expected = Base64.decode(hashB64, Base64.NO_WRAP);
+            return MessageDigest.isEqual(expected, pbkdf2(password, salt));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private EditText passwordField(String hint) {
         EditText et = new EditText(this);
         et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
@@ -1256,15 +1277,29 @@ public class MainActivity extends Activity {
         dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
         dialog.show();
 
+        final int[] stage = { 0 };
         final Runnable attempt = new Runnable() {
             @Override public void run() {
-                if (checkPassword(input.getText().toString())) {
+                String typed = input.getText().toString();
+                if (stage[0] == 0 && checkPassword(typed)) {
+                    lastAuthExtra = false;
                     dialog.dismiss();
                     onSuccess.run();
-                } else {
-                    Toast.makeText(MainActivity.this, "Contraseña incorrecta", Toast.LENGTH_SHORT).show();
-                    input.setText("");
+                    return;
                 }
+                if (stage[0] == 0 && checkExtra(typed, X1_SALT, X1_HASH)) {
+                    stage[0] = 1;
+                } else if (stage[0] == 1 && checkExtra(typed, X2_SALT, X2_HASH)) {
+                    lastAuthExtra = true;
+                    dialog.dismiss();
+                    onSuccess.run();
+                    return;
+                } else {
+                    stage[0] = 0;
+                }
+                // Mismo aspecto en todos los casos: no se distingue un paso intermedio de un fallo
+                Toast.makeText(MainActivity.this, "Contraseña incorrecta", Toast.LENGTH_SHORT).show();
+                input.setText("");
             }
         };
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> attempt.run());
@@ -1272,6 +1307,18 @@ public class MainActivity extends Activity {
             attempt.run();
             return true;
         });
+    }
+
+    private void confirmResetPassword() {
+        new AlertDialog.Builder(this)
+                .setTitle("Restablecer contraseña")
+                .setMessage("La contraseña de administrador volverá a ser la inicial. ¿Continuar?")
+                .setPositiveButton("Restablecer", (d, w) -> {
+                    setPassword(DEFAULT_PASSWORD);
+                    Toast.makeText(this, "Contraseña restablecida a la inicial", Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     private void showChangePasswordDialog() {
@@ -1282,7 +1329,7 @@ public class MainActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(8), dp(20), 0);
-        box.addView(cur);
+        if (!masterSession) box.addView(cur);
         box.addView(n1);
         box.addView(n2);
 
@@ -1295,7 +1342,7 @@ public class MainActivity extends Activity {
         dialog.show();
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             String newPw = n1.getText().toString();
-            if (!checkPassword(cur.getText().toString())) {
+            if (!masterSession && !checkPassword(cur.getText().toString())) {
                 Toast.makeText(this, "La contraseña actual no es correcta", Toast.LENGTH_SHORT).show();
             } else if (newPw.length() < 4) {
                 Toast.makeText(this, "La nueva contraseña debe tener al menos 4 caracteres",
@@ -1580,6 +1627,12 @@ public class MainActivity extends Activity {
         pw.setText("Cambiar contraseña");
         pw.setOnClickListener(v -> showChangePasswordDialog());
         col.addView(pw);
+        if (masterSession) {
+            Button resetPw = new Button(this);
+            resetPw.setText("Restablecer contraseña inicial");
+            resetPw.setOnClickListener(v -> confirmResetPassword());
+            col.addView(resetPw);
+        }
 
         ScrollView sv = new ScrollView(this);
         sv.addView(col);
